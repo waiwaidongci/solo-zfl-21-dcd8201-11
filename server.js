@@ -1,9 +1,11 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
+const { readFile, writeFile, mkdir, rename } = require("fs/promises");
 const path = require("path");
 
 const PORT = Number(process.env.PORT || 3021);
-const DB_FILE = path.join(__dirname, "data", "db.json");
+const DB_FILE = process.env.DB_FILE
+  ? path.resolve(process.env.DB_FILE)
+  : path.join(__dirname, "data", "db.json");
 
 const initialData = {
   clocks: [
@@ -39,7 +41,10 @@ const initialData = {
       qualified: false,
       note: "仍偏快，振幅尚可"
     }
-  ]
+  ],
+  batches: [],
+  recalls: [],
+  replacements: []
 };
 
 const routes = [
@@ -52,7 +57,15 @@ const routes = [
   "POST /clocks/:id/retests",
   "GET /clocks/:id/latest-retest",
   "GET /adjustments",
-  "GET /retests"
+  "GET /retests",
+  "POST /batches",
+  "GET /batches",
+  "GET /batches/:id",
+  "POST /batches/:id/recall",
+  "GET /batches/:id/affected",
+  "POST /batches/:id/replacements",
+  "GET /recalls",
+  "GET /recalls/:id"
 ];
 
 async function ensureDb() {
@@ -60,17 +73,28 @@ async function ensureDb() {
   try {
     JSON.parse(await readFile(DB_FILE, "utf8"));
   } catch {
-    await writeFile(DB_FILE, JSON.stringify(initialData, null, 2));
+    await writeDb(initialData);
   }
 }
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  // 旧版本库文件没有批次相关字段，读取时补齐，保证重启后平滑迁移
+  db.clocks ||= [];
+  db.adjustments ||= [];
+  db.retests ||= [];
+  db.batches ||= [];
+  db.recalls ||= [];
+  db.replacements ||= [];
+  return db;
 }
 
 async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
+  // 先写临时文件再原子改名，避免写一半留下损坏的库文件
+  const tmpFile = `${DB_FILE}.${process.pid}.tmp`;
+  await writeFile(tmpFile, JSON.stringify(data, null, 2));
+  await rename(tmpFile, DB_FILE);
 }
 
 function send(res, status, body) {
@@ -137,6 +161,65 @@ function clockSummary(db, clock) {
   };
 }
 
+function findBatch(db, batchId) {
+  const batch = db.batches.find((item) => item.id === batchId);
+  if (!batch) {
+    const error = new Error("批次不存在");
+    error.status = 404;
+    throw error;
+  }
+  return batch;
+}
+
+function findRecallByBatch(db, batchId) {
+  return db.recalls.find((item) => item.batchId === batchId) || null;
+}
+
+function lockedRecallFor(db, clockId) {
+  return db.recalls.find((recall) =>
+    recall.items.some((item) => item.clockId === clockId && item.status === "locked")
+  ) || null;
+}
+
+function assertClockNotLocked(db, clockId) {
+  const recall = lockedRecallFor(db, clockId);
+  if (recall) {
+    const error = new Error(`钟表涉及批次召回（召回单 ${recall.id}），调校与复测已锁定，请先登记替换件解除`);
+    error.status = 409;
+    throw error;
+  }
+}
+
+function recallProgress(recall) {
+  const total = recall.items.length;
+  const released = recall.items.filter((item) => item.status === "released").length;
+  return { total, released, pending: total - released, done: released === total };
+}
+
+function batchSummary(db, batch) {
+  const recall = findRecallByBatch(db, batch.id);
+  return {
+    ...batch,
+    affectedCount: batch.clockIds.length,
+    recallId: recall ? recall.id : null,
+    progress: recall ? recallProgress(recall) : null
+  };
+}
+
+function recallView(db, recall) {
+  const batch = db.batches.find((item) => item.id === recall.batchId) || null;
+  return {
+    ...recall,
+    batchCode: batch ? batch.code : null,
+    items: recall.items.map((item) => {
+      const clock = db.clocks.find((entry) => entry.id === item.clockId) || null;
+      const replacement = db.replacements.find((entry) => entry.id === item.replacementId) || null;
+      return { ...item, clockCode: clock ? clock.code : null, replacement };
+    }),
+    progress: recallProgress(recall)
+  };
+}
+
 async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
@@ -189,6 +272,7 @@ async function handle(req, res) {
   const adjustmentMatch = pathname.match(/^\/clocks\/([^/]+)\/adjustments$/);
   if (adjustmentMatch && req.method === "POST") {
     const clock = findClock(db, adjustmentMatch[1]);
+    assertClockNotLocked(db, clock.id);
     const body = await parseBody(req);
     required(body, ["currentDailyRateSeconds", "direction", "amount"]);
     const adjustment = {
@@ -208,6 +292,7 @@ async function handle(req, res) {
   const retestMatch = pathname.match(/^\/clocks\/([^/]+)\/retests$/);
   if (retestMatch && req.method === "POST") {
     const clock = findClock(db, retestMatch[1]);
+    assertClockNotLocked(db, clock.id);
     const body = await parseBody(req);
     required(body, ["dailyRateSeconds", "amplitude"]);
     const adjustmentId = body.adjustmentId || latestAdjustment(db, clock.id)?.id || null;
@@ -251,11 +336,177 @@ async function handle(req, res) {
     return send(res, 200, { data });
   }
 
+  // 登记批次并关联调校中的钟表；任何校验失败都不会写入
+  if (req.method === "POST" && pathname === "/batches") {
+    const body = await parseBody(req);
+    required(body, ["code", "partName"]);
+    if (db.batches.some((item) => item.code === body.code)) {
+      const error = new Error("批次编号已存在");
+      error.status = 409;
+      throw error;
+    }
+    const clockIds = Array.isArray(body.clockIds) ? [...new Set(body.clockIds)] : [];
+    const missing = clockIds.filter((id) => !db.clocks.some((clock) => clock.id === id));
+    if (missing.length) {
+      const error = new Error(`批次关联的钟表不存在：${missing.join(", ")}`);
+      error.status = 400;
+      throw error;
+    }
+    const batch = {
+      id: makeId("batch"),
+      code: body.code,
+      partName: body.partName,
+      supplier: body.supplier || "",
+      note: body.note || "",
+      clockIds,
+      status: "active",
+      createdAt: new Date().toISOString(),
+      recalledAt: null
+    };
+    db.batches.push(batch);
+    await writeDb(db);
+    return send(res, 201, { data: batchSummary(db, batch) });
+  }
+
+  if (req.method === "GET" && pathname === "/batches") {
+    const status = url.searchParams.get("status");
+    let data = db.batches.map((batch) => batchSummary(db, batch));
+    if (status !== null) {
+      data = data.filter((item) => item.status === status);
+    }
+    return send(res, 200, { data });
+  }
+
+  const batchMatch = pathname.match(/^\/batches\/([^/]+)$/);
+  if (batchMatch && req.method === "GET") {
+    const batch = findBatch(db, batchMatch[1]);
+    const clocks = batch.clockIds.map((id) => db.clocks.find((clock) => clock.id === id)).filter(Boolean);
+    const recall = findRecallByBatch(db, batch.id);
+    return send(res, 200, {
+      data: { ...batchSummary(db, batch), clocks, recall: recall ? recallView(db, recall) : null }
+    });
+  }
+
+  // 批次召回：一个批次只建一张召回单，重复/并发提交返回已有单据且不重置处置进度
+  const recallMatch = pathname.match(/^\/batches\/([^/]+)\/recall$/);
+  if (recallMatch && req.method === "POST") {
+    const batch = findBatch(db, recallMatch[1]);
+    const existing = findRecallByBatch(db, batch.id);
+    if (existing) {
+      return send(res, 200, { data: recallView(db, existing), duplicated: true });
+    }
+    const body = await parseBody(req);
+    required(body, ["reason"]);
+    const now = new Date().toISOString();
+    const recall = {
+      id: makeId("recall"),
+      batchId: batch.id,
+      reason: body.reason,
+      note: body.note || "",
+      createdAt: now,
+      items: batch.clockIds.map((clockId) => ({
+        clockId,
+        status: "locked",
+        lockedAt: now,
+        releasedAt: null,
+        replacementId: null
+      }))
+    };
+    batch.status = "recalled";
+    batch.recalledAt = now;
+    db.recalls.push(recall);
+    await writeDb(db);
+    return send(res, 201, { data: recallView(db, recall) });
+  }
+
+  // 受影响钟表清单
+  const affectedMatch = pathname.match(/^\/batches\/([^/]+)\/affected$/);
+  if (affectedMatch && req.method === "GET") {
+    const batch = findBatch(db, affectedMatch[1]);
+    const recall = findRecallByBatch(db, batch.id);
+    return send(res, 200, { data: recall ? recallView(db, recall).items : [] });
+  }
+
+  // 替换件登记：逐只解除锁定；同一钟表重复登记返回已有记录，不重复建单
+  const replacementMatch = pathname.match(/^\/batches\/([^/]+)\/replacements$/);
+  if (replacementMatch && req.method === "POST") {
+    const batch = findBatch(db, replacementMatch[1]);
+    const body = await parseBody(req);
+    required(body, ["clockId"]);
+    const recall = findRecallByBatch(db, batch.id);
+    if (!recall) {
+      const error = new Error("批次尚未召回，不能登记替换件");
+      error.status = 409;
+      throw error;
+    }
+    const item = recall.items.find((entry) => entry.clockId === body.clockId);
+    if (!item) {
+      const error = new Error("该钟表不在本批次召回影响清单中");
+      error.status = 404;
+      throw error;
+    }
+    if (item.status === "released") {
+      const existing = db.replacements.find((entry) => entry.id === item.replacementId) || null;
+      return send(res, 200, { data: existing, duplicated: true });
+    }
+    const now = new Date().toISOString();
+    const replacement = {
+      id: makeId("replacement"),
+      recallId: recall.id,
+      batchId: batch.id,
+      clockId: body.clockId,
+      note: body.note || "",
+      createdAt: now
+    };
+    db.replacements.push(replacement);
+    item.status = "released";
+    item.releasedAt = now;
+    item.replacementId = replacement.id;
+    await writeDb(db);
+    return send(res, 201, { data: replacement, recall: recallView(db, recall) });
+  }
+
+  if (req.method === "GET" && pathname === "/recalls") {
+    const batchId = url.searchParams.get("batchId");
+    const data = db.recalls
+      .filter((item) => !batchId || item.batchId === batchId)
+      .map((item) => recallView(db, item));
+    return send(res, 200, { data });
+  }
+
+  const recallDetailMatch = pathname.match(/^\/recalls\/([^/]+)$/);
+  if (recallDetailMatch && req.method === "GET") {
+    const recall = db.recalls.find((item) => item.id === recallDetailMatch[1]);
+    if (!recall) {
+      const error = new Error("召回单不存在");
+      error.status = 404;
+      throw error;
+    }
+    return send(res, 200, { data: recallView(db, recall) });
+  }
+
   return send(res, 404, { error: "接口不存在", routes });
 }
 
+// 写请求串行执行：读-改-写不交错，并发召回/替换不会重复建单或互相覆盖
+let writeChain = Promise.resolve();
+function enqueueWrite(task) {
+  const result = writeChain.then(() => task());
+  writeChain = result.catch(() => {});
+  return result;
+}
+
 const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  const run = () =>
+    handle(req, res).catch((error) => {
+      try {
+        send(res, error.status || 500, { error: error.message || "服务器错误" });
+      } catch {
+        // 连接已断开等情况，忽略
+      }
+    });
+  if (req.method === "GET" || req.method === "HEAD") return run();
+  return enqueueWrite(run);
 });
 
 server.listen(PORT, () => {
