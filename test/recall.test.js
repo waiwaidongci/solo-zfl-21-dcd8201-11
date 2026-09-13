@@ -75,6 +75,31 @@ async function api(base, method, pathname, body) {
   return { status: res.status, body: json };
 }
 
+// 发送原始字符串请求体，用于构造 null、数组等非对象JSON
+async function apiRaw(base, method, pathname, raw) {
+  const res = await fetch(`${base}${pathname}`, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: raw
+  });
+  let json = null;
+  try {
+    json = await res.json();
+  } catch {
+    // 非JSON响应
+  }
+  return { status: res.status, body: json };
+}
+
+async function readPersisted(dbFile) {
+  const raw = JSON.parse(await fs.readFile(dbFile, "utf8"));
+  return {
+    batches: raw.batches || [],
+    recalls: raw.recalls || [],
+    replacements: raw.replacements || []
+  };
+}
+
 async function createClock(base, code) {
   const res = await api(base, "POST", "/clocks", {
     code,
@@ -495,4 +520,142 @@ test("旧接口回归：钟表、调校、复测、查询行为不变", { timeou
   assert.equal(notFound.status, 404);
   const noRoute = await api(base, "GET", "/no-such-route");
   assert.equal(noRoute.status, 404);
+});
+
+test("输入边界：空请求体与非JSON对象请求体一律400且不落库", { timeout: 60000 }, async (t) => {
+  const { base, dbFile } = await freshServer(t);
+  const { batch } = await createBatchWithClocks(base, 1);
+  const before = await readPersisted(dbFile);
+  assert.equal(before.batches.length, 1);
+
+  const badRequests = [
+    () => api(base, "POST", "/batches"), // 空请求体
+    () => apiRaw(base, "POST", "/batches", "null"),
+    () => apiRaw(base, "POST", "/batches", "[1,2]"),
+    () => apiRaw(base, "POST", "/batches", "\"文本\""),
+    () => apiRaw(base, "POST", "/batches", "123"),
+    () => apiRaw(base, "POST", "/batches", "true"),
+    () => api(base, "POST", `/batches/${batch.id}/recall`), // 空请求体
+    () => apiRaw(base, "POST", `/batches/${batch.id}/recall`, "null"),
+    () => apiRaw(base, "POST", `/batches/${batch.id}/recall`, "[]"),
+    () => api(base, "POST", `/batches/${batch.id}/replacements`), // 空请求体
+    () => apiRaw(base, "POST", `/batches/${batch.id}/replacements`, "null")
+  ];
+  for (const send of badRequests) {
+    const res = await send();
+    assert.equal(res.status, 400, `应返回400，实际 ${res.status}: ${JSON.stringify(res.body)}`);
+    assert.equal(typeof res.body.error, "string");
+  }
+
+  // 不得新增批次、召回或锁定记录
+  const after = await readPersisted(dbFile);
+  assert.deepEqual(after, before);
+  const detail = await api(base, "GET", `/batches/${batch.id}`);
+  assert.equal(detail.body.data.status, "active");
+  assert.equal(detail.body.data.recall, null);
+});
+
+test("输入边界：空字段与错误类型一律400且不落库", { timeout: 60000 }, async (t) => {
+  const { base, dbFile } = await freshServer(t);
+  const { batch, clocks } = await createBatchWithClocks(base, 1);
+  const clock = clocks[0];
+  const before = await readPersisted(dbFile);
+
+  // 批次编号、部件名称显式空值/空白/错误类型
+  const badBatchBodies = [
+    { code: null, partName: "擒纵叉" },
+    { code: "", partName: "擒纵叉" },
+    { code: "   ", partName: "擒纵叉" },
+    { code: 123, partName: "擒纵叉" },
+    { code: {}, partName: "擒纵叉" },
+    { code: "BATCH-BAD", partName: null },
+    { code: "BATCH-BAD", partName: "" },
+    { code: "BATCH-BAD", partName: "  " },
+    { code: "BATCH-BAD", partName: 5 },
+    // clockIds 错误类型
+    { code: "BATCH-BAD", partName: "擒纵叉", clockIds: clock.id },
+    { code: "BATCH-BAD", partName: "擒纵叉", clockIds: 5 },
+    { code: "BATCH-BAD", partName: "擒纵叉", clockIds: {} },
+    { code: "BATCH-BAD", partName: "擒纵叉", clockIds: null },
+    { code: "BATCH-BAD", partName: "擒纵叉", clockIds: [123] },
+    { code: "BATCH-BAD", partName: "擒纵叉", clockIds: [""] },
+    { code: "BATCH-BAD", partName: "擒纵叉", clockIds: ["  "] },
+    { code: "BATCH-BAD", partName: "擒纵叉", clockIds: [clock.id, null] },
+    // 可选字段错误类型
+    { code: "BATCH-BAD", partName: "擒纵叉", supplier: 1 },
+    { code: "BATCH-BAD", partName: "擒纵叉", note: false }
+  ];
+  for (const body of badBatchBodies) {
+    const res = await api(base, "POST", "/batches", body);
+    assert.equal(res.status, 400, `应拒绝 ${JSON.stringify(body)}，实际 ${res.status}`);
+    assert.equal(typeof res.body.error, "string");
+  }
+
+  // 召回原因显式空值/空白/错误类型
+  for (const body of [{ reason: null }, { reason: "" }, { reason: "  " }, { reason: 0 }, { reason: "有效原因", note: 1 }]) {
+    const res = await api(base, "POST", `/batches/${batch.id}/recall`, body);
+    assert.equal(res.status, 400, `应拒绝 ${JSON.stringify(body)}，实际 ${res.status}`);
+  }
+  // 召回原因非法不得产生召回单与锁定
+  let detail = await api(base, "GET", `/batches/${batch.id}`);
+  assert.equal(detail.body.data.status, "active");
+  assert.equal(detail.body.data.recall, null);
+
+  // 合法召回后，替换件 clockId 空值/错误类型
+  const recall = await api(base, "POST", `/batches/${batch.id}/recall`, { reason: "批次缺陷" });
+  assert.equal(recall.status, 201);
+  for (const body of [{ clockId: null }, { clockId: "" }, { clockId: "  " }, { clockId: 1 }, { clockId: clock.id, note: 3 }]) {
+    const res = await api(base, "POST", `/batches/${batch.id}/replacements`, body);
+    assert.equal(res.status, 400, `应拒绝 ${JSON.stringify(body)}，实际 ${res.status}`);
+  }
+
+  // 除该次合法召回外无任何新增记录；锁定未被解除
+  const after = await readPersisted(dbFile);
+  assert.equal(after.batches.length, before.batches.length);
+  assert.equal(after.recalls.length, 1);
+  assert.equal(after.replacements.length, 0);
+  detail = await api(base, "GET", `/recalls/${recall.body.data.id}`);
+  assert.equal(detail.body.data.items[0].status, "locked");
+});
+
+test("输入边界：合法请求正常写入，字符串字段去除首尾空白", { timeout: 60000 }, async (t) => {
+  const { base } = await freshServer(t);
+  const clock = await createClock(base, "CLK-VALID");
+
+  // 合法登记：首尾空白被修剪，clockIds 去重
+  const created = await api(base, "POST", "/batches", {
+    code: "  BATCH-TRIM  ",
+    partName: " 擒纵叉 ",
+    supplier: "供应商A",
+    clockIds: [clock.id, clock.id]
+  });
+  assert.equal(created.status, 201);
+  assert.equal(created.body.data.code, "BATCH-TRIM");
+  assert.equal(created.body.data.partName, "擒纵叉");
+  assert.equal(created.body.data.supplier, "供应商A");
+  assert.deepEqual(created.body.data.clockIds, [clock.id]);
+
+  // 修剪后的编号参与唯一性判断
+  const dup = await api(base, "POST", "/batches", { code: "BATCH-TRIM", partName: "摆轮" });
+  assert.equal(dup.status, 409);
+
+  // 不带 clockIds 也合法
+  const noClocks = await api(base, "POST", "/batches", { code: "BATCH-EMPTY", partName: "游丝" });
+  assert.equal(noClocks.status, 201);
+  assert.deepEqual(noClocks.body.data.clockIds, []);
+
+  // 合法召回：原因修剪空白；合法替换：clockId 容忍首尾空白
+  const recall = await api(base, "POST", `/batches/${created.body.data.id}/recall`, { reason: "  批次缺陷 " });
+  assert.equal(recall.status, 201);
+  assert.equal(recall.body.data.reason, "批次缺陷");
+  const dupRecall = await api(base, "POST", `/batches/${created.body.data.id}/recall`, { reason: "批次缺陷" });
+  assert.equal(dupRecall.status, 200);
+  assert.equal(dupRecall.body.duplicated, true);
+  const replacement = await api(base, "POST", `/batches/${created.body.data.id}/replacements`, {
+    clockId: `  ${clock.id}  `
+  });
+  assert.equal(replacement.status, 201);
+  assert.equal(replacement.body.data.clockId, clock.id);
+  const recalls = await api(base, "GET", "/recalls");
+  assert.equal(recalls.body.data[0].progress.done, true);
 });

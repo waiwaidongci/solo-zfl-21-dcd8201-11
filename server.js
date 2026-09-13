@@ -106,13 +106,20 @@ async function parseBody(req) {
   let raw = "";
   for await (const chunk of req) raw += chunk;
   if (!raw) return {};
+  let data;
   try {
-    return JSON.parse(raw);
+    data = JSON.parse(raw);
   } catch {
     const error = new Error("请求体必须是合法JSON");
     error.status = 400;
     throw error;
   }
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    const error = new Error("请求体必须是JSON对象");
+    error.status = 400;
+    throw error;
+  }
+  return data;
 }
 
 function makeId(prefix) {
@@ -126,6 +133,43 @@ function required(body, fields) {
     error.status = 400;
     throw error;
   }
+}
+
+// 批次/召回接口的严格校验：必填字段必须是非空字符串（拒绝 null、数字、空白串）
+function requiredStrings(body, fields) {
+  const invalid = fields.filter((field) => typeof body[field] !== "string" || body[field].trim() === "");
+  if (invalid.length) {
+    const error = new Error(`字段必须是非空字符串：${invalid.join(", ")}`);
+    error.status = 400;
+    throw error;
+  }
+}
+
+function optionalStrings(body, fields) {
+  const invalid = fields.filter(
+    (field) => body[field] !== undefined && body[field] !== null && typeof body[field] !== "string"
+  );
+  if (invalid.length) {
+    const error = new Error(`字段必须是字符串：${invalid.join(", ")}`);
+    error.status = 400;
+    throw error;
+  }
+}
+
+function parseClockIds(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    const error = new Error("clockIds 必须是字符串数组");
+    error.status = 400;
+    throw error;
+  }
+  const ids = [...new Set(value)];
+  if (ids.some((id) => typeof id !== "string" || id.trim() === "")) {
+    const error = new Error("clockIds 元素必须是非空字符串");
+    error.status = 400;
+    throw error;
+  }
+  return ids;
 }
 
 function findClock(db, clockId) {
@@ -339,13 +383,16 @@ async function handle(req, res) {
   // 登记批次并关联调校中的钟表；任何校验失败都不会写入
   if (req.method === "POST" && pathname === "/batches") {
     const body = await parseBody(req);
-    required(body, ["code", "partName"]);
-    if (db.batches.some((item) => item.code === body.code)) {
+    requiredStrings(body, ["code", "partName"]);
+    optionalStrings(body, ["supplier", "note"]);
+    const code = body.code.trim();
+    const partName = body.partName.trim();
+    const clockIds = parseClockIds(body.clockIds);
+    if (db.batches.some((item) => item.code === code)) {
       const error = new Error("批次编号已存在");
       error.status = 409;
       throw error;
     }
-    const clockIds = Array.isArray(body.clockIds) ? [...new Set(body.clockIds)] : [];
     const missing = clockIds.filter((id) => !db.clocks.some((clock) => clock.id === id));
     if (missing.length) {
       const error = new Error(`批次关联的钟表不存在：${missing.join(", ")}`);
@@ -354,8 +401,8 @@ async function handle(req, res) {
     }
     const batch = {
       id: makeId("batch"),
-      code: body.code,
-      partName: body.partName,
+      code,
+      partName,
       supplier: body.supplier || "",
       note: body.note || "",
       clockIds,
@@ -391,17 +438,18 @@ async function handle(req, res) {
   const recallMatch = pathname.match(/^\/batches\/([^/]+)\/recall$/);
   if (recallMatch && req.method === "POST") {
     const batch = findBatch(db, recallMatch[1]);
+    const body = await parseBody(req);
+    requiredStrings(body, ["reason"]);
+    optionalStrings(body, ["note"]);
     const existing = findRecallByBatch(db, batch.id);
     if (existing) {
       return send(res, 200, { data: recallView(db, existing), duplicated: true });
     }
-    const body = await parseBody(req);
-    required(body, ["reason"]);
     const now = new Date().toISOString();
     const recall = {
       id: makeId("recall"),
       batchId: batch.id,
-      reason: body.reason,
+      reason: body.reason.trim(),
       note: body.note || "",
       createdAt: now,
       items: batch.clockIds.map((clockId) => ({
@@ -432,14 +480,16 @@ async function handle(req, res) {
   if (replacementMatch && req.method === "POST") {
     const batch = findBatch(db, replacementMatch[1]);
     const body = await parseBody(req);
-    required(body, ["clockId"]);
+    requiredStrings(body, ["clockId"]);
+    optionalStrings(body, ["note"]);
+    const clockId = body.clockId.trim();
     const recall = findRecallByBatch(db, batch.id);
     if (!recall) {
       const error = new Error("批次尚未召回，不能登记替换件");
       error.status = 409;
       throw error;
     }
-    const item = recall.items.find((entry) => entry.clockId === body.clockId);
+    const item = recall.items.find((entry) => entry.clockId === clockId);
     if (!item) {
       const error = new Error("该钟表不在本批次召回影响清单中");
       error.status = 404;
@@ -454,7 +504,7 @@ async function handle(req, res) {
       id: makeId("replacement"),
       recallId: recall.id,
       batchId: batch.id,
-      clockId: body.clockId,
+      clockId,
       note: body.note || "",
       createdAt: now
     };
